@@ -38,7 +38,7 @@ namespace first_schedule_solver
     const int DEFAULT_MAX_RUNTIME = 60; // seconds
 
     // yyyy-mm-dd helpers
-    int date_diff_days(const std::string &start, const std::string &end)
+    inline int date_diff_days(const std::string &start, const std::string &end)
     {
         std::tm tm_start = {}, tm_end = {};
         std::istringstream ss_start(start);
@@ -51,7 +51,7 @@ namespace first_schedule_solver
         return static_cast<int>(std::chrono::duration_cast<std::chrono::hours>(t_end - t_start).count() / 24) + 1;
     }
 
-    std::string add_days(const std::string &start_date, int offset_days)
+    inline std::string add_days(const std::string &start_date, int offset_days)
     {
         std::tm tm = {};
         std::istringstream ss(start_date);
@@ -84,6 +84,7 @@ namespace first_schedule_solver
                                      ? opts.time_limit_seconds
                                      : config.value("TIME_LIMIT_SECONDS", DEFAULT_MAX_RUNTIME);
 
+                                     
         // matrix
         std::vector<std::vector<int>> raw_matrix;
         raw_matrix.reserve(dist_matrix_raw.size());
@@ -107,6 +108,12 @@ namespace first_schedule_solver
         std::string max_date = all_dates.back();
         int num_days = date_diff_days(min_date, max_date);
         int num_vehicles = vehicles_per_day * num_days;
+
+        if (opts.log_search) {
+            std::cout << "[solve] VPD=" << vehicles_per_day
+            << " TL=" << time_limit_s << "s"
+            << " days=" << num_days << "\n";
+        }
 
         int routing_index = 1;
         task_nodes.reserve(tasks.size() * 2);
@@ -310,8 +317,33 @@ namespace first_schedule_solver
             }
         }
 
+        // for (int v = 0; v < num_vehicles; ++v)
+        // {
+        //     int day = v / vehicles_per_day;
+        //     int start_idx = routing.Start(v);
+        //     int end_idx = routing.End(v);
+        //     int start = day * max_duration;
+        //     int end = (day + 1) * max_duration;
+        //     time_dim.CumulVar(start_idx)->SetRange(start, end);
+        //     time_dim.CumulVar(end_idx)->SetRange(start, end);
+        // }
+
+        // Also clamp each node's cumul to its own day window [start, end)
+        for (const auto &node : task_nodes)
+        {
+            int index = manager.NodeToIndex(NodeIndex(node.routing_node));
+            // node.start/end were built as: day_index * route_limit .. +route_limit
+            time_dim_mut->CumulVar(index)->SetRange(node.start, node.end);
+        }
+
+        for (const auto &node : task_nodes)
+        {
+            int index = manager.NodeToIndex(NodeIndex(node.routing_node));
+            routing.SetAllowedVehiclesForIndex(node.allowed_vehicles, index);
+        }
+
         // Disjunctions (at-most-one day-option per task)
-        const int penalty = 1000000; // external logic should reject drops; high soft penalty
+        const int penalty = 100000000; // external logic should reject drops; high soft penalty
         for (const auto &kv : disjunction_groups_map)
         {
             const auto &group = kv.second;
@@ -321,7 +353,8 @@ namespace first_schedule_solver
 
         // Search params with overrides
         RoutingSearchParameters search_params = DefaultRoutingSearchParameters();
-        search_params.set_first_solution_strategy(opts.first_solution_strategy);
+        // search_params.set_first_solution_strategy(opts.first_solution_strategy);
+        search_params.set_first_solution_strategy(FirstSolutionStrategy::PARALLEL_CHEAPEST_INSERTION);
         // keep the rest as you have it:
         search_params.set_local_search_metaheuristic(LocalSearchMetaheuristic::GUIDED_LOCAL_SEARCH);
         search_params.set_number_of_solutions_to_collect(std::max(1, opts.num_solutions_to_collect));

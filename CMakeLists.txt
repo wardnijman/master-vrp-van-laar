@@ -139,13 +139,11 @@ add_executable(sa_solver
   src/penalties.cpp
   src/sa.cpp
   src/schedule_state.cpp
-  src/seed_scoring.cpp
   src/seed_generators.cpp
   src/schedule_state.cpp
   src/seed.cpp
   src/first_solution_parser.cpp
   src/first_schedule_solver.cpp
-  src/first_schedule_middleman.cpp
 )
 
 # set(CMAKE_BUILD_TYPE Debug)

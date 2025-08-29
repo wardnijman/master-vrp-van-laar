@@ -6,12 +6,14 @@
 
 #include "ortools/constraint_solver/routing.h"
 #include "ortools/constraint_solver/routing_index_manager.h"
-#include "ortools/constraint_solver/assignment.h"
 
 // Your project types:
 #include "first_schedule_solver.h"  // for TaskNode (must include: task_id, day, client_id, routing_node or equivalent)
 
 // ---------- Extraction (from a solved multi-day first-schedule model) ----------
+
+    using namespace operations_research;
+using NodeIndex = RoutingIndexManager::NodeIndex;
 
 // Build day -> route -> ordered task_ids (depot omitted).
 std::vector<std::vector<std::vector<std::string>>>

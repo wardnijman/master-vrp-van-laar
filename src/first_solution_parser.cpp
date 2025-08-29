@@ -98,7 +98,7 @@ json parse_solution(
     {
         out["error"] = "No solution found";
         out["assignments"] = json::array();
-        out["dropped"] = json::array();
+        // out["dropped"] = json::array();
         out["canonical_weekday_by_schema"] = json::object();
         return out;
     }
@@ -133,16 +133,16 @@ json parse_solution(
         }
     }
 
-    // Dropped disjunction alternatives (not selected)
-    json dropped = json::array();
-    for (const auto &n : task_nodes)
-    {
-        int ridx = manager.NodeToIndex(NodeIndex(n.routing_node));
-        if (solution->Value(routing.NextVar(ridx)) == ridx)
-        {
-            dropped.push_back({{"task_id", n.task_id}, {"date", n.day}});
-        }
-    }
+    // // Dropped disjunction alternatives (not selected)
+    // json dropped = json::array();
+    // for (const auto &n : task_nodes)
+    // {
+    //     int ridx = manager.NodeToIndex(NodeIndex(n.routing_node));
+    //     if (solution->Value(routing.NextVar(ridx)) == ridx)
+    //     {
+    //         dropped.push_back({{"task_id", n.task_id}, {"date", n.day}});
+    //     }
+    // }
 
     // Build canonical weekday per schema_number (mode of assigned weekdays)
     // First: task_id -> schema_number (from task_map)
@@ -188,7 +188,7 @@ json parse_solution(
         /*task_nodes=*/task_nodes);
 
     out["assignments"] = std::move(assignments);
-    out["dropped"] = std::move(dropped);
+    // out["dropped"] = std::move(dropped);
     out["canonical_weekday_by_schema"] = std::move(canon_json);
     return out;
 }

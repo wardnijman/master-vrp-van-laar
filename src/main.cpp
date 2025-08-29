@@ -1,476 +1,352 @@
-// main.cpp — updated to use the new first-schedule “middleman” when --seed-only is set.
-// Note: diversity gating in the middleman currently uses an assignment-based distance
-// (task→(day,route) equality ratio). If you want Hungarian/Jaccard route matching later,
-// we can swap it in the middleman without touching main.cpp.
-
-#include "validation.h"
-#include "utils.h"
-#include "day_solver.h"
-#include "parse.h"
-#include "seed_io.h"
-
-// SA 2-level headers
-#include "sa.h"
-#include "types.h"
-#include "schedule_state.h"
-
-// SEED portfolio (kept for the non-middleman path)
-#include "seed_scoring.h"
-#include "seed_generators.h"
-
-// First-schedule (2-week rollout) solver
-#include "first_schedule_solver.h"
-#include "first_solution_parser.h"
-
-// NEW: middleman that harvests 26v runs, eliminates to 25, and warm-start polishes
-#include "first_schedule_middleman.h"
-
-#include <fstream>
-#include <iostream>
-#include <unordered_set>
-#include <unordered_map>
-#include <cassert>
-#include <cctype>
-#include <cmath>
-#include <iomanip>
-#include <string>
-#include <sstream>
-#include <ctime>
-#include <filesystem>
+// main.cpp
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include "third_party/json/single_include/nlohmann/json.hpp"
-#include "tests.h"
+#include "utils.h"
+#include "types.h"
+#include "first_solution_parser.h"
+#include "first_schedule_solver.h"   // use header (for SolveOptions + API)
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static bool g_verbose = false;
+// ---------------- Minimal CLI ----------------
+struct Flags {
+  std::string mode = "all";       // {init|alns|all}
+  std::string tasks_path;         // required
+  std::string matrix_path;        // required
+  std::string config_path;        // required
+  std::string seeds_in_dir = "";  // optional warm-start pool
+  bool verbose = true;            // flipped by --quiet
+};
 
-// ---------- CLI ----------
-static void print_usage()
-{
-    std::cerr
-        << "Usage: ./sa_solver tasks.json time_matrix_seconds.json [options]\n"
-        << "Options:\n"
-        << "  --first-weeks=W                 First-schedule window length in weeks (default 2)\n"
-        << "  --cache-matrix                  Use matrix cache (validation path only)\n"
-        << "  -v, --verbose                   Verbose logs\n"
-        << "  --iters=N                       SA iterations (default 10000)\n"
-        << "  --seed=N                        RNG seed (wired into SA)\n"
-        << "  --explore-seconds=S             Per-day time during seed scoring (default 2)\n"
-        << "  --intensify-seconds=S           Per-day time during SA intensification (default 60)\n"
-        << "  --gens=g1,g2,...                Seed generators to run "
-           "(default: passthrough,two_week_rollout,capacity_balanced,sweep)\n"
-        << "  --topk=K                        Keep top-K seeds (default 3)\n"
-        << "  --seeds-out=DIR                 Write seeds to DIR (default: ./out_seeds)\n"
-        << "  --seed-only                     Build seeds via middleman and exit (skip SA)\n"
-        << "  --mm-runs=N                     Middleman: number of relaxed 26-vehicle runs (default 16)\n"
-        << "  --mm-relaxed-vehicles=N         Middleman: relaxed vehicles_per_day (default 26)\n"
-        << "  --mm-target-vehicles=N          Middleman: target vehicles_per_day (default 25)\n"
-        << "  --mm-relaxed-seconds=S          Middleman: time limit per relaxed run (default 30)\n"
-        << "  --mm-polish-seconds=S           Middleman: time limit per 25v polish (default 15)\n"
-        << "  --mm-diversity=F                Middleman: diversity threshold (default 0.10)\n"
-        << "  --mm-seed-base=N                Middleman: base RNG seed added per run index (default 12345)\n";
+static void print_usage() {
+  std::cout <<
+R"(Usage:
+  solver --mode {init|alns|all} --tasks tasks.json --matrix matrix.json --config config.json [--seeds_in DIR] [--quiet]
+
+Required:
+  --mode {init|alns|all}
+  --tasks PATH
+  --matrix PATH
+  --config PATH
+
+Optional:
+  --seeds_in DIR      Load warm-start seeds (JSON files) from directory
+  --quiet             Less logging
+  --help
+)";
 }
 
-// ---------- MAIN ----------
-int main(int argc, char *argv[])
-{
-    if (argc < 3)
-    {
-        print_usage();
-        return 1;
+static Flags parse_flags(int argc, char** argv) {
+  Flags f;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    auto need = [&](const char* name) {
+      if (i + 1 >= argc) { std::cerr << "Missing value for " << name << "\n"; std::exit(2); }
+      return std::string(argv[++i]);
+    };
+    if (a == "--help" || a == "-h") { print_usage(); std::exit(0); }
+    else if (a == "--mode")   f.mode = need("--mode");
+    else if (a == "--tasks")  f.tasks_path = need("--tasks");
+    else if (a == "--matrix") f.matrix_path = need("--matrix");
+    else if (a == "--config") f.config_path = need("--config");
+    else if (a == "--seeds_in") f.seeds_in_dir = need("--seeds_in");
+    else if (a == "--quiet") f.verbose = false;
+    else { std::cerr << "Unknown flag: " << a << "\n"; print_usage(); std::exit(2); }
+  }
+  if (f.tasks_path.empty() || f.matrix_path.empty() || f.config_path.empty()) {
+    std::cerr << "Missing required --tasks/--matrix/--config.\n"; print_usage(); std::exit(2);
+  }
+  return f;
+}
+
+// ---------------- Small utils ----------------
+static json load_json(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) throw std::runtime_error("Cannot open file: " + path);
+  json j; in >> j; return j;
+}
+static void save_json(const std::string& path, const json& j) {
+  fs::create_directories(fs::path(path).parent_path());
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("Cannot write file: " + path);
+  out << std::setw(2) << j << "\n";
+}
+static std::vector<std::string> list_json_files(const std::string& dir) {
+  std::vector<std::string> res;
+  if (dir.empty() || !fs::exists(dir)) return res;
+  for (auto& p : fs::directory_iterator(dir)) {
+    if (p.is_regular_file() && p.path().extension() == ".json") res.push_back(p.path().string());
+  }
+  std::sort(res.begin(), res.end());
+  return res;
+}
+static std::string timestamp() {
+  auto t = std::time(nullptr); std::tm tm{};
+#if defined(_WIN32)
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  std::ostringstream oss; oss << std::put_time(&tm, "%Y%m%d-%H%M%S"); return oss.str();
+}
+static std::string seed_filename(const std::string& out_dir, int run_idx, int vehicles) {
+  std::ostringstream oss; oss << out_dir << "/seed_" << vehicles << "veh_run" << run_idx << "_" << timestamp() << ".json";
+  return oss.str();
+}
+
+// ---------------- Config helpers ----------------
+struct Cfg {
+  // relaxed seeding
+  int relaxed_vehicles;
+  int relaxed_runs;
+  int relaxed_time_limit_s;
+  int threads;
+  int rng_base_seed;
+  std::string seeds_out_dir;
+
+  // target + ALNS
+  int target_vehicles;
+  int alns_time_limit_s;
+  int alns_moves;
+  double vehicle_penalty_alpha;
+  bool log_progress;
+  std::string result_out;
+
+  // pass-through base config JSON (to feed into first_schedule_solver)
+  json base;
+};
+
+static Cfg parse_config(const json& j) {
+  const unsigned def_threads_u = std::max(1u, std::thread::hardware_concurrency());
+  const int def_threads = (def_threads_u > static_cast<unsigned>(std::numeric_limits<int>::max()))
+      ? std::numeric_limits<int>::max()
+      : static_cast<int>(def_threads_u);
+
+  Cfg c{
+    /*relaxed_vehicles*/      j.value("RELAXED_VEHICLES", 26),
+    /*relaxed_runs*/          j.value("RELAXED_RUNS", 4),
+    /*relaxed_time_limit_s*/  j.value("RELAXED_TIME_LIMIT_SECONDS", 1800),
+    /*threads*/               j.value("THREADS", def_threads),
+    /*rng_base_seed*/         j.value("RNG_BASE_SEED", 12345),
+    /*seeds_out_dir*/         j.value("SEEDS_OUT_DIR", std::string("seeds")),
+    /*target_vehicles*/       j.value("TARGET_VEHICLES", 25),
+    /*alns_time_limit_s*/     j.value("ALNS_TIME_LIMIT_SECONDS", 3600),
+    /*alns_moves*/            j.value("ALNS_MOVES", 20000),
+    /*vehicle_penalty_alpha*/ j.value("ALPHA", 0.0),
+    /*log_progress*/          j.value("LOG_PROGRESS", true),
+    /*result_out*/            j.value("RESULT_OUT", std::string("result.json")),
+    /*base*/                  j
+  };
+  return c;
+}
+
+// ---------------- Optional ALNS hook ----------------
+namespace inspiration {
+  nlohmann::json run_alns(const nlohmann::json& tasks,
+                          const nlohmann::json& matrix,
+                          const nlohmann::json& base_config,
+                          const std::vector<nlohmann::json>& seed_solutions,
+                          const nlohmann::json& alns_params);
+}
+
+// ---------------- Seeding (parallel relaxed runs) ----------------
+static std::vector<json> run_relaxed_seeds_parallel(const Cfg& c,
+                                                    bool verbose,
+                                                    const json& tasks,
+                                                    const json& matrix,
+                                                    json base_config) {
+  // Tag (optional) and uppercase keys (if solver ever reads from JSON),
+  // but we *enforce* limits via SolveOptions below.
+  base_config["RELAXED_FIRST_PASS"] = true;
+  base_config["VEHICLES_PER_DAY"]   = c.relaxed_vehicles;     // harmless duplicate with opts
+  base_config["TIME_LIMIT_SECONDS"] = c.relaxed_time_limit_s; // harmless duplicate with opts
+
+  if (verbose) {
+    std::cout << "🧭 Relaxed seeding:"
+              << " runs=" << c.relaxed_runs
+              << " threads=" << c.threads
+              << " veh=" << c.relaxed_vehicles
+              << " tlimit=" << c.relaxed_time_limit_s << "s\n";
+  }
+
+  fs::create_directories(c.seeds_out_dir);
+
+  std::atomic<int> next_idx{0};
+  std::mutex io_mu;
+  std::vector<std::future<void>> pool;
+  std::vector<json> seeds(c.relaxed_runs);
+
+  const int max_threads = std::max(1, std::min(c.threads, c.relaxed_runs));
+  for (int t = 0; t < max_threads; ++t) {
+    pool.emplace_back(std::async(std::launch::async, [&]() {
+      for (;;) {
+        int i = next_idx.fetch_add(1);
+        if (i >= c.relaxed_runs) break;
+
+        json cfg_i = base_config;
+
+        // Enforce limits via SolveOptions (bullet-proof)
+        first_schedule_solver::SolveOptions so{};
+        so.log_search             = verbose;
+        so.vehicles_per_day       = c.relaxed_vehicles;
+        so.time_limit_seconds     = c.relaxed_time_limit_s;
+        so.random_seed            = c.rng_base_seed + i;
+        so.enable_operator_bundle = true;          // keep LS rich on long runs
+        so.overtime_cap_minutes     = 45;   // try 30–60 for relaxed seeding
+        so.overtime_soft_coeff      = 1;    // small penalty per minute overtime
+        // Optional extra knobs (uncomment if desired):
+        // so.lns_time_limit_seconds = c.relaxed_time_limit_s; // per-LNS cap
+        // so.log_search = verbose;
+
+        auto t0 = NowMillis();
+        json sol;
+        try {
+          sol = first_schedule_solver::solve_problem(tasks, matrix, cfg_i, so);
+        } catch (const std::exception& e) {
+          std::lock_guard<std::mutex> lk(io_mu);
+          std::cerr << "Relaxed run " << i << " failed: " << e.what() << "\n";
+          continue;
+        }
+        auto t1 = NowMillis();
+
+        sol["meta"]["relaxed_run_index"] = i;
+        sol["meta"]["elapsed_ms"] = static_cast<long long>(t1 - t0);
+        sol["meta"]["vehicles_used"] = c.relaxed_vehicles;
+
+        const std::string out_path = seed_filename(c.seeds_out_dir, i, c.relaxed_vehicles);
+        try { save_json(out_path, sol); }
+        catch (const std::exception& e) {
+          std::lock_guard<std::mutex> lk(io_mu);
+          std::cerr << "Failed to save seed " << i << ": " << e.what() << "\n";
+        }
+
+        {
+          std::lock_guard<std::mutex> lk(io_mu);
+          if (verbose) std::cout << "   ✓ Seed " << i << " (" << (t1 - t0) << " ms) -> " << out_path << "\n";
+        }
+        seeds[i] = std::move(sol);
+      }
+    }));
+  }
+  for (auto& fut : pool) fut.get();
+
+  std::vector<json> out;
+  out.reserve(seeds.size());
+  for (auto& s : seeds) if (!s.is_null() && !s.empty()) out.push_back(std::move(s));
+  return out;
+}
+
+static std::vector<json> load_seeds_from_dir(const std::string& dir, bool verbose) {
+  std::vector<json> res;
+  for (const auto& f : list_json_files(dir)) {
+    try { res.push_back(load_json(f)); if (verbose) std::cout << "   • loaded seed: " << f << "\n"; }
+    catch (const std::exception& e) { std::cerr << "   ! failed to load " << f << ": " << e.what() << "\n"; }
+  }
+  return res;
+}
+
+// ---------------- Main ----------------
+int main(int argc, char** argv) {
+  std::ios::sync_with_stdio(false);
+  const Flags flags = parse_flags(argc, argv);
+
+  if (flags.verbose) {
+    std::cout << "🚀 VRP Van Laar — init + ALNS\n";
+    std::cout << "Mode: " << flags.mode << "\n";
+  }
+
+  json tasks, matrix, cfg_json;
+  try {
+    tasks = load_json(flags.tasks_path);
+    matrix = load_json(flags.matrix_path);
+    cfg_json = load_json(flags.config_path);
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to load inputs: " << e.what() << "\n"; return 1;
+  }
+
+  const Cfg cfg = parse_config(cfg_json);
+  if (flags.verbose) {
+    std::cout << "Config: relaxed_veh=" << cfg.relaxed_vehicles
+              << " runs=" << cfg.relaxed_runs
+              << " threads=" << cfg.threads
+              << " target_veh=" << cfg.target_vehicles << "\n";
+  }
+
+  // Warm pool (optional)
+  std::vector<json> seed_pool;
+  if (!flags.seeds_in_dir.empty()) {
+    if (flags.verbose) std::cout << "📂 Loading warm-start seeds from: " << flags.seeds_in_dir << "\n";
+    auto loaded = load_seeds_from_dir(flags.seeds_in_dir, flags.verbose);
+    seed_pool.insert(seed_pool.end(), loaded.begin(), loaded.end());
+  }
+
+  // INIT
+  if (flags.mode == "init" || flags.mode == "all") {
+    auto new_seeds = run_relaxed_seeds_parallel(cfg, flags.verbose, tasks, matrix, cfg.base);
+    if (new_seeds.empty()) {
+      std::cerr << "No seeds produced in INIT.\n";
+      if (flags.mode == "init") return 2;
+    }
+    seed_pool.insert(seed_pool.end(), new_seeds.begin(), new_seeds.end());
+    if (flags.verbose) std::cout << "📦 Seed pool size after INIT: " << seed_pool.size() << "\n";
+  }
+
+  // ALNS
+  if (flags.mode == "alns" || flags.mode == "all") {
+    if (seed_pool.empty() && flags.verbose) {
+      std::cout << "⚠️  No seeds available. Proceeding with empty pool; ALNS should self-seed.\n";
     }
 
-    // Defaults
-    int first_weeks = 2;
-    bool use_matrix_cache = false;
-    int iters = 10000;
-    int seed = 42;
-    int explore_seconds = 2;
-    int intensify_seconds = 60;
-    int top_k = 3;
-    bool seed_only = false;
-    fs::path seeds_out_dir = "./out_seeds";
-    std::vector<std::string> generators = {
-        "passthrough", "two_week_rollout", "capacity_balanced", "sweep"};
+    json alns_params = {
+      {"time_limit_seconds", cfg.alns_time_limit_s},
+      {"max_moves", cfg.alns_moves},
+      {"target_vehicles", cfg.target_vehicles},
+      {"vehicle_penalty_alpha", cfg.vehicle_penalty_alpha},
+      {"log_progress", cfg.log_progress},
+      {"ramp_schedule", {{"alpha_step", 0.25}, {"every_moves", 2000}}},
+      {"overtime_window_start_min", 60},
+      {"overtime_window_end_min", 0}
+    };
 
-    // Middleman defaults
-    int mm_runs = 16;
-    int mm_relaxed_vehicles = 26;
-    int mm_target_vehicles = 25;
-    int mm_relaxed_seconds = 30;
-    int mm_polish_seconds = 15;
-    double mm_diversity = 0.10;
-    int mm_seed_base = 12345;
-
-    // Parse CLI flags
-    for (int i = 3; i < argc; ++i)
-    {
-        std::string arg = argv[i];
-        if (arg.rfind("--first-weeks=", 0) == 0)
-        {
-            first_weeks = std::max(1, std::stoi(arg.substr(14)));
-        }
-        else if (arg == "--cache-matrix")
-        {
-            std::cout << "Using matrix cache\n";
-            use_matrix_cache = true;
-        }
-        else if (arg == "--verbose" || arg == "-v")
-        {
-            g_verbose = true;
-        }
-        else if (arg.rfind("--iters=", 0) == 0)
-        {
-            iters = std::stoi(arg.substr(8));
-        }
-        else if (arg.rfind("--seed=", 0) == 0)
-        {
-            seed = std::stoi(arg.substr(7));
-        }
-        else if (arg.rfind("--explore-seconds=", 0) == 0)
-        {
-            explore_seconds = std::stoi(arg.substr(18));
-        }
-        else if (arg.rfind("--intensify-seconds=", 0) == 0)
-        {
-            intensify_seconds = std::stoi(arg.substr(20));
-        }
-        else if (arg.rfind("--gens=", 0) == 0)
-        {
-            generators.clear();
-            std::string s = arg.substr(7);
-            size_t pos = 0;
-            while (pos != std::string::npos)
-            {
-                size_t next = s.find(',', pos);
-                generators.emplace_back(s.substr(pos, next == std::string::npos ? next : (next - pos)));
-                if (next == std::string::npos)
-                    break;
-                pos = next + 1;
-            }
-        }
-        else if (arg.rfind("--topk=", 0) == 0)
-        {
-            top_k = std::max(1, std::stoi(arg.substr(7)));
-        }
-        else if (arg.rfind("--seeds-out=", 0) == 0)
-        {
-            seeds_out_dir = fs::path(arg.substr(12));
-        }
-        else if (arg == "--seed-only")
-        {
-            seed_only = true;
-        }
-        // Middleman options
-        else if (arg.rfind("--mm-runs=", 0) == 0)
-        {
-            mm_runs = std::max(1, std::stoi(arg.substr(10)));
-        }
-        else if (arg.rfind("--mm-relaxed-vehicles=", 0) == 0)
-        {
-            mm_relaxed_vehicles = std::max(1, std::stoi(arg.substr(22)));
-        }
-        else if (arg.rfind("--mm-target-vehicles=", 0) == 0)
-        {
-            mm_target_vehicles = std::max(1, std::stoi(arg.substr(21)));
-        }
-        else if (arg.rfind("--mm-relaxed-seconds=", 0) == 0)
-        {
-            mm_relaxed_seconds = std::max(1, std::stoi(arg.substr(21)));
-        }
-        else if (arg.rfind("--mm-polish-seconds=", 0) == 0)
-        {
-            mm_polish_seconds = std::max(1, std::stoi(arg.substr(20)));
-        }
-        else if (arg.rfind("--mm-diversity=", 0) == 0)
-        {
-            mm_diversity = std::stod(arg.substr(15));
-        }
-        else if (arg.rfind("--mm-seed-base=", 0) == 0)
-        {
-            mm_seed_base = std::stoi(arg.substr(15));
-        }
-        else
-        {
-            std::cerr << "Unknown option: " << arg << "\n";
-            print_usage();
-            return 1;
-        }
+    if (flags.verbose) {
+      std::cout << "🧩 ALNS starting..."
+                << " time=" << cfg.alns_time_limit_s << "s"
+                << " moves=" << cfg.alns_moves
+                << " target_veh=" << cfg.target_vehicles << "\n";
     }
 
-    // Load tasks & matrix
-    json tasks_json;
-    {
-        std::ifstream f(argv[1]);
-        if (!f)
-        {
-            std::cerr << "Cannot open tasks file: " << argv[1] << "\n";
-            return 1;
-        }
-        try
-        {
-            f >> tasks_json;
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Failed to parse tasks JSON: " << e.what() << "\n";
-            return 1;
-        }
-    }
-    json matrix_json;
-    {
-        std::ifstream f(argv[2]);
-        if (!f)
-        {
-            std::cerr << "Cannot open matrix file: " << argv[2] << "\n";
-            return 1;
-        }
-        try
-        {
-            f >> matrix_json;
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Failed to parse matrix JSON: " << e.what() << "\n";
-            return 1;
-        }
+    json final_result;
+    try {
+      // Hook up when ready:
+      // final_result = inspiration::run_alns(tasks, matrix, cfg.base, seed_pool, alns_params);
+      final_result = { {"meta", {{"note","ALNS not yet implemented"}}} };
+    } catch (const std::exception& e) {
+      std::cerr << "ALNS failed: " << e.what() << "\n"; return 3;
     }
 
-    // Baseline config for validation & day caps
-    json config = {
-        {"MAX_HOURS_PER_DAY", 9},
-        {"VEHICLES_PER_DAY", 30},
-        {"TIME_LIMIT_SECONDS", 30},
-        {"USE_MATRIX_CACHE", use_matrix_cache}};
+    try { save_json(cfg.result_out, final_result); }
+    catch (const std::exception& e) { std::cerr << "Failed to write result: " << e.what() << "\n"; return 4; }
 
-    // Validate full input (as usual)
-    try
-    {
-        std::cout << "🔍 Validating...\n";
-        vl::validate_all(tasks_json, matrix_json, config);
-        std::cout << "✅ Input validated.\n";
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Validation error: " << e.what() << "\n";
-        return 1;
-    }
+    if (flags.verbose) std::cout << "✅ Result written to " << cfg.result_out << "\n";
+  }
 
-    // -------- FIRST SCHEDULE WINDOW (2 weeks by default) --------
-    const std::string min_date = find_min_date(tasks_json);
-    const std::string win_end = ymd_add_days(min_date, first_weeks * 7 - 1);
-    json window_tasks = filter_tasks_to_window(tasks_json, min_date, win_end);
-
-    if (g_verbose) {
-        std::cout << "Window: [" << min_date << " .. " << win_end << "]\n";
-        // std::cout << "window_tasks: " << window_tasks.dump(2) << "\n"; // uncomment if you really want the dump
-    }
-
-    // If we only want to generate seeds via the middleman, do it now and exit.
-    if (seed_only)
-    {
-        fsmm::Config mmcfg;
-        mmcfg.runs = mm_runs;
-        mmcfg.vehicles_relaxed = mm_relaxed_vehicles;
-        mmcfg.vehicles_target  = mm_target_vehicles;
-        mmcfg.time_limit_relaxed_s = mm_relaxed_seconds;
-        mmcfg.time_limit_polish_s  = mm_polish_seconds;
-        mmcfg.diversity_threshold  = mm_diversity;
-        mmcfg.random_seed_base     = mm_seed_base;
-        mmcfg.verbose              = g_verbose;
-
-        std::cout << "🧪 Middleman seeding: runs=" << mmcfg.runs
-                  << " relaxed=" << mmcfg.vehicles_relaxed
-                  << " target="  << mmcfg.vehicles_target
-                  << " tlx="     << mmcfg.time_limit_relaxed_s
-                  << " tlp="     << mmcfg.time_limit_polish_s
-                  << " div="     << mmcfg.diversity_threshold
-                  << " base-seed=" << mmcfg.random_seed_base
-                  << "\n";
-
-        std::vector<json> seeds = fsmm::build_seeds(window_tasks, matrix_json, config, mmcfg);
-
-        fs::create_directories(seeds_out_dir);
-        int written = 0;
-        for (size_t i = 0; i < seeds.size(); ++i)
-        {
-            std::ostringstream fn;
-            fn << "mm_seed_" << std::setw(2) << std::setfill('0') << (i + 1) << ".json";
-            const fs::path path = seeds_out_dir / fn.str();
-            std::ofstream out(path);
-            if (!out) {
-                std::cerr << "Failed to write: " << path.string() << "\n";
-                continue;
-            }
-            out << seeds[i].dump(2) << "\n";
-            ++written;
-            if (g_verbose) std::cout << "  wrote " << path.string() << "\n";
-        }
-        std::cout << "💾 Middleman wrote " << written << " seed(s) to: " << seeds_out_dir.string() << "\n";
-        std::cout << "✅ --seed-only set; exiting after seed generation.\n";
-        return 0;
-    }
-
-    // ---------- ORIGINAL seed portfolio path (kept for SA) ----------
-    // Solve the first-schedule window once to extract canonicals
-    json first_sol;
-    try
-    {
-        std::cout << "🧭 First-schedule solve for window [" << min_date << " .. " << win_end << "]\n";
-        first_sol = first_schedule_solver::solve_problem(window_tasks, matrix_json, config);
-        std::cout << "✅ First-schedule solution obtained.\n";
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "First-schedule solver error: " << e.what() << "\n";
-        return 1;
-    }
-
-    // Extract canonical weekday per schema from the first-schedule result
-    std::unordered_map<int, int> canonical;
-    if (first_sol.contains("canonical_weekday_by_schema") &&
-        first_sol["canonical_weekday_by_schema"].is_object())
-    {
-        for (auto it = first_sol["canonical_weekday_by_schema"].begin();
-             it != first_sol["canonical_weekday_by_schema"].end(); ++it)
-        {
-            int schema = std::stoi(it.key());
-            int wd1 = it.value().get<int>();
-            canonical[schema] = wd1;
-        }
-    }
-    else
-    {
-        canonical = canonical_from_first_schedule(first_sol, tasks_json);
-    }
-
-    if (g_verbose)
-    {
-        std::cout << "Canonical weekdays (schema -> wd1..7): ";
-        int shown = 0;
-        for (const auto &kv : canonical)
-        {
-            if (shown++ >= 12) { std::cout << "..."; break; }
-            std::cout << kv.first << ":" << kv.second << " ";
-        }
-        std::cout << "\n";
-    }
-
-    // Build a single-day-option seed for the FULL horizon using the canonicals
-    std::vector<Task> base_seed_tasks = build_seed_from_canonical(tasks_json, canonical);
-
-    // Light balancing for weeks not covered by the first window (service-only heuristic)
-    balance_seed_service_load(base_seed_tasks, tasks_json,
-                              config["VEHICLES_PER_DAY"].get<int>(),
-                              config["MAX_HOURS_PER_DAY"].get<int>() * 60);
-
-    // -------- Build & rank seed portfolio on top of this base assignment --------
-    register_default_seed_generators();
-
-    // Build TimeMatrix minutes for seed scoring
-    TimeMatrix TM = build_time_matrix_minutes(matrix_json);
-
-    // Seed scoring config uses real day VRP (short time) for fairness across seeds
-    EvalConfig eval_cfg;
-    eval_cfg.max_routes_per_day = config["VEHICLES_PER_DAY"].get<int>();
-    eval_cfg.max_hours_per_route = config["MAX_HOURS_PER_DAY"].get<int>();
-    eval_cfg.matrix = &TM;
-    eval_cfg.day_cfg = {};
-    eval_cfg.day_cfg.vehicles = eval_cfg.max_routes_per_day;
-    eval_cfg.day_cfg.route_limit_minutes = eval_cfg.max_hours_per_route * 60;
-    eval_cfg.day_cfg.soft_upper_cost = 1;
-    eval_cfg.day_cfg.span_coeff = 0;
-    eval_cfg.explore_params = {};
-    eval_cfg.explore_params.time_limit_seconds = std::max(1, explore_seconds);
-    eval_cfg.explore_params.use_warm_start = false;
-    eval_cfg.explore_params.log_search = false;
-
-    // Which generators to run
-    std::cout << "🧩 Building seeds from base assignment: ";
-    for (size_t i = 0; i < generators.size(); ++i)
-        std::cout << generators[i] << (i + 1 < generators.size() ? "," : "");
-    std::cout << "  (topk=" << top_k << ")\n";
-
-    // Run portfolio
-    auto ranked = build_and_rank_seeds(generators, base_seed_tasks, eval_cfg, top_k);
-    if (ranked.empty())
-    {
-        std::cerr << "No seeds produced.\n";
-        return 1;
-    }
-
-    print_ranked_seeds(ranked);
-
-    // Write seeds to disk
-    fs::create_directories(seeds_out_dir);
-    for (size_t i = 0; i < ranked.size(); ++i)
-    {
-        const auto &rs = ranked[i];
-        std::ostringstream fn;
-        fn << std::setw(2) << std::setfill('0') << (i + 1) << "_" << rs.seed.name << ".json";
-        write_seed_json(rs, seeds_out_dir / fn.str());
-    }
-    std::cout << "💾 Wrote " << ranked.size() << " seed(s) to: " << seeds_out_dir.string() << "\n";
-
-    // -------- SA path (unchanged) --------
-    int max_week = 0;
-    std::vector<TaskRef> tasks_ref = build_tasks(tasks_json, max_week);
-
-    SA_Config cfg;
-    cfg.total_weeks = max_week;
-    cfg.day_cfg.vehicles = config["VEHICLES_PER_DAY"].get<int>();
-    cfg.day_cfg.route_limit_minutes = config["MAX_HOURS_PER_DAY"].get<int>() * 60;
-    cfg.day_cfg.exploration_seconds = std::max(1, explore_seconds);
-    cfg.day_cfg.intensify_seconds = std::max(cfg.day_cfg.exploration_seconds, intensify_seconds);
-    cfg.W.w_dev = 100;
-    cfg.W.w_space = 120;
-    cfg.W.w_ot = 7;
-    cfg.W.w_vu = 1;
-    cfg.T0 = 5.0;
-    cfg.alpha = 0.995;
-    cfg.iters = iters;
-    cfg.reheats_every = 3000;
-    cfg.verbose = g_verbose;
-    cfg.seed = seed;
-
-    // Quick warm-start smoke test
-    assert_warmup_working(tasks_ref, TM, cfg);
-
-    if (g_verbose)
-    {
-        std::cout << std::boolalpha
-                  << "Config:\n"
-                  << "  weeks=" << cfg.total_weeks << "\n"
-                  << "  vehicles/day=" << cfg.day_cfg.vehicles << "\n"
-                  << "  route_limit_minutes=" << cfg.day_cfg.route_limit_minutes << "\n"
-                  << "  iters=" << cfg.iters << "\n"
-                  << "  explore_seconds=" << cfg.day_cfg.exploration_seconds << "\n"
-                  << "  intensify_seconds=" << cfg.day_cfg.intensify_seconds << "\n"
-                  << "  verbose=" << g_verbose << "\n"
-                  << "  seed=" << seed << "\n";
-    }
-
-    SA_Result res;
-    try
-    {
-        std::cout << "🚀 Running SA 2-level optimizer...\n";
-        res = run_sa(tasks_ref, TM, cfg);
-        std::cout << "🏁 SA done.\n";
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Solve error: " << e.what() << "\n";
-        return 1;
-    }
-
-    json out = {
-        {"meta", {{"vehicles_per_day", cfg.day_cfg.vehicles}, {"route_limit_minutes", cfg.day_cfg.route_limit_minutes}, {"iters", cfg.iters}, {"explore_seconds", cfg.day_cfg.exploration_seconds}, {"intensify_seconds", cfg.day_cfg.intensify_seconds}, {"seed", cfg.seed}}},
-        {"best_cost", {{"routes_minutes", res.best_cost.routes_minutes}, {"weekday_deviation", res.best_cost.weekday_dev}, {"variant_spacing", res.best_cost.spacing}, {"overtime_and_vehicle", res.best_cost.ot_vu}, {"total", res.best_cost.total()}}},
-        {"calendar", serialize_calendar(res.best_state)}};
-
-    std::cout << out.dump(2) << "\n";
-    return 0;
+  if (flags.verbose) std::cout << "🏁 Done.\n";
+  return 0;
 }
