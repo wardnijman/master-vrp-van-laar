@@ -17,6 +17,7 @@
 #include "day_solver.h"
 #include "utils.h"
 #include "types.h"
+#include <random>
 
 static std::unordered_map<std::string, SeedGeneratorFn>& REGISTRY() {
   static std::unordered_map<std::string, SeedGeneratorFn> r;
@@ -71,6 +72,22 @@ static std::unordered_map<int,int> canonical_weekday_by_schema(const std::vector
   }
   return canon;
 }
+
+
+// ---------- Diversity utilities ----------
+
+// Build maps: task_id -> chosen weekday/date
+static std::unordered_map<std::string,int> map_weekday(const Seed& s) {
+  std::unordered_map<std::string,int> m; m.reserve(s.tasks.size());
+  for (auto& t : s.tasks) if (!t.day_options.empty()) m[t.task_id]=t.day_options.front().weekday;
+  return m;
+}
+static std::unordered_map<std::string,std::string> map_date(const Seed& s) {
+  std::unordered_map<std::string,std::string> m; m.reserve(s.tasks.size());
+  for (auto& t : s.tasks) if (!t.day_options.empty()) m[t.task_id]=t.day_options.front().date;
+  return m;
+}
+
 
 // Intra-week spacing penalty for variants of same schema_number in same week
 static double compute_intraweek_spacing_penalty(
@@ -197,7 +214,7 @@ static DayEvalResult evaluate_single_day_with_solver(
 
 // -------------------- seed-shape validation --------------------
 
-static std::string run_validation(const std::vector<Task>& tasks) {
+std::string run_validation(const std::vector<Task>& tasks) {
   if (tasks.empty()) return "No tasks in seed.";
   for (const auto& t : tasks) {
     if (t.day_options.size() != 1) return "Each task must have exactly 1 day_option in a seed.";
@@ -274,6 +291,132 @@ SeedScore evaluate_seed_cost(const Seed& seed, const EvalConfig& cfg) {
   return sc;
 }
 
+// Hamming distance over chosen weekday (normalized by |intersection of tasks|)
+static double weekday_hamming(const Seed& a, const Seed& b) {
+  auto ma = map_weekday(a), mb = map_weekday(b);
+  size_t agree=0, total=0;
+  for (auto& kv : ma) {
+    auto it = mb.find(kv.first);
+    if (it==mb.end()) continue;
+    total++;
+    if (it->second == kv.second) agree++;
+  }
+  if (total==0) return 0.0;
+  return 1.0 - (double)agree / (double)total;
+}
+
+// Per-date Jaccard of client sets, averaged
+static double perdate_jaccard(const Seed& a, const Seed& b) {
+  auto ada = map_date(a), bda = map_date(b);
+  // invert to date -> set<client>
+  std::unordered_map<std::string, std::set<int>> A,B;
+  for (auto& t : a.tasks) if (!t.day_options.empty()) A[t.day_options.front().date].insert(t.client_id);
+  for (auto& t : b.tasks) if (!t.day_options.empty()) B[t.day_options.front().date].insert(t.client_id);
+
+  // union of dates
+  std::set<std::string> dates;
+  for (auto& kv : A) dates.insert(kv.first);
+  for (auto& kv : B) dates.insert(kv.first);
+
+  double sum=0.0; int cnt=0;
+  for (auto& d : dates) {
+    const auto& Sa = A[d];
+    const auto& Sb = B[d];
+    if (Sa.empty() && Sb.empty()) continue;
+    // Jaccard distance = 1 - |∩|/|∪|
+    std::vector<int> inter, uni;
+    std::set_intersection(Sa.begin(),Sa.end(), Sb.begin(),Sb.end(), std::back_inserter(inter));
+    std::set_union       (Sa.begin(),Sa.end(), Sb.begin(),Sb.end(), std::back_inserter(uni));
+    double jd = 1.0 - (uni.empty() ? 0.0 : (double)inter.size()/(double)uni.size());
+    sum += jd; cnt++;
+  }
+  return cnt ? (sum / cnt) : 0.0;
+}
+
+// Final distance: convex combo
+static double seed_distance(const Seed& a, const Seed& b) {
+  const double w_ham = 0.7, w_jac = 0.3;
+  return w_ham * weekday_hamming(a,b) + w_jac * perdate_jaccard(a,b);
+}
+
+// Greedy max–min selection: pick one best (low cost), then repeatedly add the seed
+// that maximizes distance to the current selected set (min distance to any selected).
+static std::vector<RankedSeed> pick_diverse(const std::vector<RankedSeed>& in, int k) {
+  if ((int)in.size() <= k) return in;
+  // start from the best cost
+  std::vector<RankedSeed> cand = in;
+  std::vector<RankedSeed> out; out.reserve(k);
+  out.push_back(cand.front());
+
+  while ((int)out.size() < k) {
+    int best_i = -1; double best_score=-1.0;
+    for (int i=1;i<(int)cand.size();++i) {
+      const Seed& s = cand[i].seed;
+      double mind = 1e9;
+      for (auto& rsel : out) {
+        mind = std::min(mind, seed_distance(s, rsel.seed));
+      }
+      if (mind > best_score) { best_score = mind; best_i = i; }
+    }
+    if (best_i < 0) break;
+    out.push_back(cand[best_i]);
+    cand.erase(cand.begin() + best_i);
+  }
+  return out;
+}
+
+// New: build many candidates (with slight randomization), keep top_by_cost per generator,
+// then pick a final diverse_k across all.
+std::vector<RankedSeed> build_rank_and_pick_diverse(
+  const std::vector<std::string>& generator_names,
+  const std::vector<Task>& base_tasks,
+  const EvalConfig& cfg,
+  int per_generator_trials,
+  int keep_top_by_cost_per_gen,
+  int diverse_k,
+  int rng_seed)
+{
+  register_default_seed_generators();
+
+  std::mt19937 rng(rng_seed);
+  std::vector<RankedSeed> all;
+
+  for (const auto& name : generator_names) {
+    if (!SeedRegistry::has(name)) continue;
+    auto gen = SeedRegistry::get(name);
+
+    std::vector<RankedSeed> bucket;
+
+    for (int t=0; t<per_generator_trials; ++t) {
+      // light randomization: shuffle a copy for generators that consider order
+      std::vector<Task> shuffled = base_tasks;
+      std::shuffle(shuffled.begin(), shuffled.end(), rng);
+
+      Seed s = gen(shuffled);
+      s.name = name;
+
+      RankedSeed r; r.seed = std::move(s);
+      if (auto msg = run_validation(r.seed.tasks); !msg.empty()) {
+        r.score.valid = false; r.score.validation_error = msg; r.score.total_cost = 1e18;
+      } else {
+        r.score = evaluate_seed_cost(r.seed, cfg);
+      }
+      bucket.push_back(std::move(r));
+    }
+
+    sort_by_cost(bucket);
+    if ((int)bucket.size() > keep_top_by_cost_per_gen) bucket.resize(keep_top_by_cost_per_gen);
+    all.insert(all.end(), bucket.begin(), bucket.end());
+  }
+
+  sort_by_cost(all);
+  // Now pick a diverse subset across all
+  if (diverse_k > 0 && (int)all.size() > diverse_k) {
+    return pick_diverse(all, diverse_k);
+  }
+  return all;
+}
+
 // -------------------- build & rank seeds --------------------
 
 std::vector<RankedSeed> build_and_rank_seeds(
@@ -321,5 +464,8 @@ void sort_by_cost(std::vector<RankedSeed>& v) {
                      return a.score.total_cost < b.score.total_cost;
                    });
 }
+
+
+
 
 

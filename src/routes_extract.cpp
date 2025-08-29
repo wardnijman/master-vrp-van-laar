@@ -200,3 +200,44 @@ read_assignment_from_routes_task_ids(
   }
   return assign;
 }
+
+// Converts a relaxed-solver JSON (one selected option per task) into a Seed
+// with exactly one day_option per Task.
+Seed seed_from_relaxed_json(const nlohmann::json& sol_json, const std::vector<Task>& original_tasks) {
+  // Build task_id -> chosen date map from the solution JSON.
+  // Assuming your parse_solution writes something like: assignments[day][route][...task_id...]
+  // If you already output a flat list with {task_id,date}, use that directly.
+
+  std::unordered_map<std::string,std::string> chosen_date;
+
+  if (sol_json.contains("assigned") && sol_json["assigned"].is_array()) {
+    for (const auto& a : sol_json["assigned"]) {
+      std::string tid = a.value("task_id", "");
+      std::string d   = a.value("date", "");
+      if (!tid.empty() && !d.empty()) chosen_date[tid]=d;
+    }
+  } else if (sol_json.contains("routes_by_day")) {
+    for (auto& day : sol_json["routes_by_day"].items()) {
+      const std::string date = day.key();
+      for (const auto& route : day.value()) {
+        for (const auto& stop : route["stops"]) {
+          std::string tid = stop.value("task_id","");
+          if (!tid.empty()) chosen_date[tid]=date;
+        }
+      }
+    }
+  } // else adapt to your actual output structure
+
+  Seed s; s.name = "relaxed_json";
+  s.tasks.reserve(original_tasks.size());
+  for (const auto& t : original_tasks) {
+    const DayOption* picked=nullptr;
+    auto it = chosen_date.find(t.task_id);
+    if (it != chosen_date.end()) {
+      for (const auto& o : t.day_options) if (o.date == it->second) { picked=&o; break; }
+    }
+    if (!picked) picked = t.day_options.empty() ? nullptr : &t.day_options.front();
+    if (picked) s.tasks.push_back(choose_option(t, *picked));
+  }
+  return s;
+}

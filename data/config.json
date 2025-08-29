@@ -10,6 +10,13 @@
   "RNG_BASE_SEED": 12345,
   "SEEDS_OUT_DIR": "seeds",
 
+  "SEED_GENERATORS": ["geo_balanced","geo_regret2","two_week_rollout"],
+  "SEED_TRIALS_PER_GEN": 5,
+  "SEED_KEEP_PER_GEN": 3,
+  "SEED_DIVERSE_K": 8,
+  "HEURISTIC_SEEDS_OUT_DIR": "heuristic_seeds",
+
+
   "TARGET_VEHICLES": 25,
   "ALNS_TIME_LIMIT_SECONDS": 7200,
   "ALNS_MOVES": 50000,

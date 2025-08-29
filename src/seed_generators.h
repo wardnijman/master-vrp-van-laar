@@ -12,3 +12,11 @@ Seed passthrough_seed(const std::vector<Task>& tasks);
 Seed two_week_rollout_seed(const std::vector<Task>& tasks);
 Seed capacity_balanced_seed(const std::vector<Task>& tasks);
 Seed sweep_seed(const std::vector<Task>& tasks);
+
+Seed raw_iso_weekday_seed(const std::vector<Task>& tasks);
+
+// Optional: expose the new generators by name (registration happens in .cpp)
+Seed geo_regret2_seed(const std::vector<Task>& tasks);
+Seed geo_balanced_seed(const std::vector<Task>& tasks);
+
+void seed_generators_set_matrix(const TimeMatrix* M);

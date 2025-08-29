@@ -171,3 +171,16 @@ static std::vector<Task> load_seed_shaped_tasks_from_json(const json &tasks_json
     }
     return tasks;
 }
+
+// Validation used by main (exposed)
+std::string run_validation(const std::vector<Task>& tasks);
+
+// Build many candidates, keep best per generator by cost, then pick a diverse subset.
+std::vector<RankedSeed> build_rank_and_pick_diverse(
+  const std::vector<std::string>& generator_names,
+  const std::vector<Task>& base_tasks,
+  const EvalConfig& cfg,
+  int per_generator_trials,
+  int keep_top_by_cost_per_gen,
+  int diverse_k,
+  int rng_seed = 12345);
