@@ -525,7 +525,7 @@ static std::vector<RankedSeed> build_and_save_heuristic_seeds(
   ecfg.max_routes_per_day = cfg.target_vehicles;
   ecfg.day_cfg.vehicles = cfg.target_vehicles;
   ecfg.day_cfg.route_limit_minutes = ecfg.max_hours_per_route * 60;
-  ecfg.explore_params.time_limit_seconds = 30; // quick per-day exploratory solve
+  ecfg.explore_params.time_limit_seconds = 2; // quick per-day exploratory solve
   ecfg.explore_params.log_search = false;
 
   // Give generators access to M

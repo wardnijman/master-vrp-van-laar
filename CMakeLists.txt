@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(sa_solver)
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG -march=native")
 
 
 # Path to your static OR-Tools build

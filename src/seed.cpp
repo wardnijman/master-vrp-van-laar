@@ -11,13 +11,18 @@
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
+#include <future>
+#include <atomic>
+#include <mutex>
+#include <cstdlib>
+#include <random>
 
 #include "validation.h"
 #include "penalties.h"
 #include "day_solver.h"
 #include "utils.h"
 #include "types.h"
-#include <random>
 
 static std::unordered_map<std::string, SeedGeneratorFn>& REGISTRY() {
   static std::unordered_map<std::string, SeedGeneratorFn> r;
@@ -73,6 +78,15 @@ static std::unordered_map<int,int> canonical_weekday_by_schema(const std::vector
   return canon;
 }
 
+static int detect_num_threads() {
+  int n = (int)std::thread::hardware_concurrency();
+  if (n <= 0) n = 4;
+  if (const char* env = std::getenv("VRP_SEED_THREADS")) {
+    int e = std::atoi(env);
+    if (e > 0) n = e;
+  }
+  return n;
+}
 
 // ---------- Diversity utilities ----------
 
@@ -377,43 +391,62 @@ std::vector<RankedSeed> build_rank_and_pick_diverse(
   int rng_seed)
 {
   register_default_seed_generators();
-
-  std::mt19937 rng(rng_seed);
   std::vector<RankedSeed> all;
+
+  const int num_threads = detect_num_threads();
 
   for (const auto& name : generator_names) {
     if (!SeedRegistry::has(name)) continue;
     auto gen = SeedRegistry::get(name);
 
-    std::vector<RankedSeed> bucket;
+    const int N = std::max(1, per_generator_trials);
+    std::vector<RankedSeed> bucket; bucket.resize(N);
 
-    for (int t=0; t<per_generator_trials; ++t) {
-      // light randomization: shuffle a copy for generators that consider order
-      std::vector<Task> shuffled = base_tasks;
-      std::shuffle(shuffled.begin(), shuffled.end(), rng);
+    std::atomic<int> next(0);
 
-      Seed s = gen(shuffled);
-      s.name = name;
+    auto worker = [&](int thread_id) {
+      std::mt19937 rng((uint32_t)(rng_seed ^ (0x9E3779B9u * (thread_id + 1)) ^
+                                  (uint32_t)std::hash<std::thread::id>{}(std::this_thread::get_id())));
 
-      RankedSeed r; r.seed = std::move(s);
-      if (auto msg = run_validation(r.seed.tasks); !msg.empty()) {
-        r.score.valid = false; r.score.validation_error = msg; r.score.total_cost = 1e18;
-      } else {
-        r.score = evaluate_seed_cost(r.seed, cfg);
+      for (;;) {
+        int i = next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= N) break;
+
+        // Light randomization: shuffle copy so order-sensitive gens diversify
+        std::vector<Task> shuffled = base_tasks;
+        std::shuffle(shuffled.begin(), shuffled.end(), rng);
+
+        Seed s = gen(shuffled);
+        s.name = name;
+
+        RankedSeed r; r.seed = std::move(s);
+        if (auto msg = run_validation(r.seed.tasks); !msg.empty()) {
+          r.score.valid = false;
+          r.score.validation_error = msg;
+          r.score.total_cost = 1e18;
+        } else {
+          r.score = evaluate_seed_cost(r.seed, cfg);
+          r.score.valid = true;
+        }
+        bucket[i] = std::move(r);
       }
-      bucket.push_back(std::move(r));
-    }
+    };
+
+    const int T = std::max(1, num_threads);
+    std::vector<std::thread> pool; pool.reserve(T);
+    for (int t = 0; t < T; ++t) pool.emplace_back(worker, t);
+    for (auto& th : pool) th.join();
 
     sort_by_cost(bucket);
-    if ((int)bucket.size() > keep_top_by_cost_per_gen) bucket.resize(keep_top_by_cost_per_gen);
+    if ((int)bucket.size() > keep_top_by_cost_per_gen)
+      bucket.resize(keep_top_by_cost_per_gen);
+
     all.insert(all.end(), bucket.begin(), bucket.end());
   }
 
   sort_by_cost(all);
-  // Now pick a diverse subset across all
-  if (diverse_k > 0 && (int)all.size() > diverse_k) {
+  if (diverse_k > 0 && (int)all.size() > diverse_k)
     return pick_diverse(all, diverse_k);
-  }
   return all;
 }
 
@@ -426,31 +459,54 @@ std::vector<RankedSeed> build_and_rank_seeds(
   int top_k)
 {
   if (top_k <= 0) throw std::invalid_argument("top_k must be > 0");
-
   register_default_seed_generators();
 
-  std::vector<RankedSeed> all;
-  all.reserve(generator_names.size());
+  const int G = (int)generator_names.size();
+  std::vector<RankedSeed> all; all.resize(G);
 
-  for (const auto& name : generator_names) {
-    if (!SeedRegistry::has(name)) continue;
-    auto gen = SeedRegistry::get(name);
-    Seed s = gen(base_tasks);
-    s.name = name;
+  const int num_threads = detect_num_threads();
+  std::atomic<int> next(0);
 
-    RankedSeed r;
-    r.seed = std::move(s);
+  auto worker = [&]() {
+    // thread-local RNG (not used here, but ready if some gen shuffles internally)
+    std::mt19937 rng((unsigned)std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    for (;;) {
+      int i = next.fetch_add(1, std::memory_order_relaxed);
+      if (i >= G) break;
 
-    if (auto msg = run_validation(r.seed.tasks); !msg.empty()) {
-      r.score.valid = false;
-      r.score.validation_error = msg;
-      r.score.total_cost = 1e18;
-    } else {
-      r.score = evaluate_seed_cost(r.seed, cfg);
-      r.score.valid = true;
+      RankedSeed r{};
+      const std::string& name = generator_names[i];
+
+      if (!SeedRegistry::has(name)) {
+        r.seed.name = name;
+        r.score.valid = false;
+        r.score.validation_error = "Unknown seed generator";
+        r.score.total_cost = 1e18;
+        all[i] = std::move(r);
+        continue;
+      }
+
+      auto gen = SeedRegistry::get(name);
+      Seed s = gen(base_tasks);
+      s.name = name;
+      r.seed = std::move(s);
+
+      if (auto msg = run_validation(r.seed.tasks); !msg.empty()) {
+        r.score.valid = false;
+        r.score.validation_error = msg;
+        r.score.total_cost = 1e18;
+      } else {
+        r.score = evaluate_seed_cost(r.seed, cfg);
+        r.score.valid = true;
+      }
+      all[i] = std::move(r);
     }
-    all.push_back(std::move(r));
-  }
+  };
+
+  const int T = std::max(1, num_threads);
+  std::vector<std::thread> pool; pool.reserve(T);
+  for (int t = 0; t < T; ++t) pool.emplace_back(worker);
+  for (auto& th : pool) th.join();
 
   sort_by_cost(all);
   if ((int)all.size() > top_k) all.resize(top_k);
